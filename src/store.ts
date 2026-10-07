@@ -15,6 +15,7 @@ import {
 } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { basename, dirname, join, resolve } from "node:path";
+import { darwinStorage } from "./darwin.ts";
 
 export type Kind = "user" | "talk" | "tool" | "echo" | "note";
 export interface Message {
@@ -39,7 +40,7 @@ type Stream = {
   fd: number;
   writer?: { day: string; fd: number };
 };
-type Lease = { server: Server; failure?: Error };
+type Lease = { kind: "socket"; server: Server; failure?: Error } | { kind: "directory" };
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const filePattern = /^\d{4}-\d{2}-\d{2}\.jsonl$/;
 const messageFields = ["i", "kind", "text", "size", "date"];
@@ -123,10 +124,8 @@ function checkOwner(fd: number, path: string, directory: boolean): void {
   }
 }
 
-// Procfs exposes each descriptor as a magic link to its inode, not to the path
-// used to open it. Node has no *at() calls, so `at(fd, name)` stands in for
-// openat/mkdirat(fd, name): renaming or replacing any ancestor pathname cannot
-// redirect it, while O_NOFOLLOW still guards the final entry.
+// Linux procfs links anchor operations to held inodes. macOS uses native *at()
+// calls instead; its descriptor paths are diagnostics only, never I/O targets.
 function descriptorPath(fd: number): string {
   return `/proc/self/fd/${fd}`;
 }
@@ -135,9 +134,15 @@ function at(directoryFd: number, name: string): string {
   return `${descriptorPath(directoryFd)}/${name}`;
 }
 
-// `path` may be descriptor-relative; `display` names it in diagnostics.
-function openDirectory(path: string, display: string, follow = false): number {
-  const fd = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY | (follow ? 0 : constants.O_NOFOLLOW));
+function openAt(directoryFd: number, name: string, flags: number, mode = 0o600): number {
+  return process.platform === "darwin"
+    ? darwinStorage().openAt(directoryFd, name, flags, mode)
+    : openSync(at(directoryFd, name), flags, mode);
+}
+
+function openDirectory(path: string, display: string, follow = false, parentFd?: number): number {
+  const flags = constants.O_RDONLY | constants.O_DIRECTORY | (follow ? 0 : constants.O_NOFOLLOW);
+  const fd = parentFd === undefined ? openSync(path, flags) : openAt(parentFd, path, flags);
   try {
     checkOwner(fd, display, true);
     return fd;
@@ -151,7 +156,8 @@ function openDirectory(path: string, display: string, follow = false): number {
 // is durable where it was actually made, whatever the parent's pathname is now.
 function makeDirectory(parentFd: number, name: string): void {
   try {
-    mkdirSync(at(parentFd, name), { mode: 0o700 });
+    if (process.platform === "darwin") darwinStorage().mkdirAt(parentFd, name);
+    else mkdirSync(at(parentFd, name), { mode: 0o700 });
   } catch (error) {
     if (!hasCode(error, "EEXIST")) throw error;
   }
@@ -170,7 +176,7 @@ function openAncestor(path: string): number {
   const parent = openAncestor(dirname(path));
   try {
     makeDirectory(parent, basename(path));
-    return openSync(at(parent, basename(path)), constants.O_RDONLY | constants.O_DIRECTORY);
+    return openAt(parent, basename(path), constants.O_RDONLY | constants.O_DIRECTORY);
   } finally {
     closeSync(parent);
   }
@@ -184,7 +190,7 @@ function openRoot(path: string): number {
   const parent = openAncestor(dirname(path));
   try {
     makeDirectory(parent, basename(path));
-    return openDirectory(at(parent, basename(path)), path, true);
+    return openDirectory(basename(path), path, true, parent);
   } finally {
     closeSync(parent);
   }
@@ -193,12 +199,12 @@ function openRoot(path: string): number {
 function openStream(rootFd: number, directory: string, name: "main" | "tree"): Stream {
   const path = join(directory, name);
   makeDirectory(rootFd, name);
-  return { path, fd: openDirectory(at(rootFd, name), path) };
+  return { path, fd: openDirectory(name, path, false, rootFd) };
 }
 
-function openFile(path: string, display: string, flags: number): number {
+function openFile(directoryFd: number, name: string, display: string, flags: number): number {
   // NONBLOCK makes hostile FIFOs/devices fail validation rather than hang open().
-  const fd = openSync(path, flags | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
+  const fd = openAt(directoryFd, name, flags | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     checkOwner(fd, display, false);
     return fd;
@@ -209,10 +215,19 @@ function openFile(path: string, display: string, flags: number): number {
 }
 
 async function acquireLease(rootFd: number): Promise<Lease> {
+  if (process.platform === "darwin") {
+    try {
+      darwinStorage().lockDirectory(rootFd);
+    } catch (error) {
+      if (hasCode(error, "EWOULDBLOCK")) throw new Error("Store is already open by another writer", { cause: error });
+      throw error;
+    }
+    return { kind: "directory" };
+  }
   const identity = fstatSync(rootFd, { bigint: true });
   const key = createHash("sha256").update(`${identity.dev}:${identity.ino}`).digest("hex");
   const server = createServer((socket) => socket.destroy());
-  const lease: Lease = { server };
+  const lease: Lease = { kind: "socket", server };
   const ready = Promise.withResolvers<void>();
   let listening = false;
   server.on("error", (error: Error) => {
@@ -236,6 +251,8 @@ async function acquireLease(rootFd: number): Promise<Lease> {
 }
 
 function closeLease(lease: Lease): Promise<void> {
+  // Directory flock ownership ends when release() closes the root descriptor.
+  if (lease.kind === "directory") return Promise.resolve();
   if (!lease.server.listening) return Promise.resolve();
   const closed = Promise.withResolvers<void>();
   lease.server.close((error?: Error) => error ? closed.reject(error) : closed.resolve());
@@ -272,14 +289,13 @@ function reportSafely(report: Report | undefined, message: string): void {
 }
 
 /**
- * Private append-only storage on a local Linux filesystem supporting fsync.
- * The abstract Unix socket owns the lock until close/process death; there is no
- * PID, age timeout, stale pathname, or lock takeover. Published records are frozen.
- * The collections are Store-owned; callers read them, never mutate them.
- * After open, all I/O is relative to held directory descriptors (Linux procfs
- * links), so renaming or replacing the root or stream pathnames cannot redirect
- * replay, repairs, or writer rollover away from the leased inode. Daily files are
- * named by local write day; each message keeps its caller-supplied date.
+ * Private append-only storage on a local Linux or macOS filesystem supporting fsync.
+ * Linux uses an abstract socket; macOS locks the held root directory descriptor.
+ * Both locks last until close/process death, with no PID, timeout or stale file.
+ * Published records are frozen; the collections are Store-owned.
+ * I/O uses Linux procfs descriptor links or macOS native *at() calls, so renaming
+ * or replacing pathnames cannot redirect writes away from the leased inode.
+ * Daily files use the local write day; messages keep their supplied date.
  */
 export class Store {
   readonly messages: Message[] = [];
@@ -298,9 +314,12 @@ export class Store {
   ) {}
 
   static async open(directory: string, report?: Report): Promise<Store> {
-    if (process.platform !== "linux" || typeof process.getuid !== "function" || !existsSync("/proc/self/fd")) {
-      throw new Error("Store requires Linux procfs descriptor links, abstract Unix sockets and private POSIX filesystem permissions");
+    if (typeof process.getuid !== "function" ||
+        (process.platform !== "linux" && process.platform !== "darwin") ||
+        (process.platform === "linux" && !existsSync("/proc/self/fd"))) {
+      throw new Error("Store requires Linux procfs or macOS native descriptor operations and private POSIX filesystem permissions");
     }
+    if (process.platform === "darwin") darwinStorage();
     if (typeof directory !== "string" || directory.length === 0) {
       throw new Error("Store directory must be a nonempty path");
     }
@@ -308,7 +327,9 @@ export class Store {
     const streams: Stream[] = [];
     let lease: Lease | undefined;
     try {
-      const canonical = readlinkSync(descriptorPath(rootFd));
+      const canonical = process.platform === "darwin"
+        ? darwinStorage().descriptorPath(rootFd)
+        : readlinkSync(descriptorPath(rootFd));
       lease = await acquireLease(rootFd);
       const main = openStream(rootFd, canonical, "main");
       streams.push(main);
@@ -329,7 +350,7 @@ export class Store {
 
   private assertWritable(): void {
     if (this.closed) throw new Error("Store is closing or closed");
-    if (this.failed || this.lease.failure || !this.lease.server.listening) {
+    if (this.failed || (this.lease.kind === "socket" && (this.lease.failure || !this.lease.server.listening))) {
       throw new Error("Store write or lock failed; close and reopen before writing again");
     }
   }
@@ -348,16 +369,19 @@ export class Store {
   }
 
   private replay(report?: Report): void {
-    // Torn files keep their read descriptor so repair extends the inode just read.
-    const torn: { fd: number; path: string }[] = [];
+    // Retain validated read descriptors until all history has been checked.
+    const torn: { fd: number; path: string; directoryFd: number; name: string }[] = [];
     const readStream = (stream: Stream, receive: (value: unknown, where: string) => void) => {
-      for (const name of readdirSync(descriptorPath(stream.fd)).sort()) {
+      const names = process.platform === "darwin"
+        ? darwinStorage().readDirectory(stream.fd)
+        : readdirSync(descriptorPath(stream.fd));
+      for (const name of names.sort()) {
         const path = join(stream.path, name);
         if (!filePattern.test(name) || !Number.isFinite(Date.parse(`${name.slice(0, 10)}T00:00:00.000Z`)) ||
           new Date(`${name.slice(0, 10)}T00:00:00.000Z`).toISOString().slice(0, 10) !== name.slice(0, 10)) {
           throw new Error(`Unexpected Store stream entry: ${path}`);
         }
-        const fd = openFile(at(stream.fd, name), path, constants.O_RDONLY);
+        const fd = openFile(stream.fd, name, path, constants.O_RDONLY);
         let retained = false;
         try {
           // A writer killed between write and fsync leaves complete-looking but
@@ -382,7 +406,7 @@ export class Store {
             offset = end + 1;
           }
           if (bytes.length > 0 && bytes[bytes.length - 1] !== 10) {
-            torn.push({ fd, path });
+            torn.push({ fd, path, directoryFd: stream.fd, name });
             retained = true;
           }
         } finally {
@@ -413,10 +437,20 @@ export class Store {
       });
       for (const node of this.nodes.values()) this.validateCoverage(node);
       // Validate the complete history before making even append-only repairs.
-      for (const { fd, path } of torn) {
-        // Reopen the validated inode through its own descriptor link; no name lookup.
-        const writer = openSync(descriptorPath(fd), constants.O_WRONLY | constants.O_APPEND);
-        try { writeDurably(writer, "\n"); } finally { closeSync(writer); }
+      for (const { fd, path, directoryFd, name } of torn) {
+        // Linux reopens the descriptor link. macOS reopens relative to the held
+        // parent, then refuses repair unless it still names the validated inode.
+        const writer = process.platform === "darwin"
+          ? openAt(directoryFd, name, constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+          : openSync(descriptorPath(fd), constants.O_WRONLY | constants.O_APPEND);
+        try {
+          const source = fstatSync(fd, { bigint: true });
+          const target = fstatSync(writer, { bigint: true });
+          if (source.dev !== target.dev || source.ino !== target.ino || target.nlink !== 1n) {
+            throw new Error(`Recovery file changed before newline repair: ${path}`);
+          }
+          writeDurably(writer, "\n");
+        } finally { closeSync(writer); }
         reportSafely(report, `Recovered missing final newline at ${path}`);
       }
     } finally {
@@ -435,7 +469,7 @@ export class Store {
           closeSync(old.fd);
         }
         const name = `${day}.jsonl`;
-        const fd = openFile(at(stream.fd, name), join(stream.path, name), constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT);
+        const fd = openFile(stream.fd, name, join(stream.path, name), constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT);
         stream.writer = { day, fd };
         fsyncSync(stream.fd);
       }

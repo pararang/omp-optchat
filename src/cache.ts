@@ -18,6 +18,8 @@ const MAX_BREAKPOINTS = 4;
 const ANTHROPIC_URL = "https://api.anthropic.com";
 /** A rendered view: `<chat>`, one `id+n|text` line per part, `</chat>` (Memory.render). */
 const CHAT_VIEW = /^<chat>\n(?:\d+\+[1-9]\d*\|[^\n]*\n)*<\/chat>$/;
+/** OMP 18.8 prepends this separate host-control block after context replacement. */
+const HOST_REMINDER = /^<system-reminder>\nToday: \d{4}-\d{2}-\d{2}; current working directory: '[^\n]*'\. Do not repeat this information in your reply\.\n<\/system-reminder>$/;
 /** Fields of a plain host text block; anything else (citations, files) is never treated as the view. */
 const VIEW_BLOCK_FIELDS: Record<string, true> = {
 	type: true,
@@ -83,8 +85,9 @@ interface LeadingView {
 
 /**
  * The plugin's view: leading plain text blocks of the first user message
- * (after Responses developer/system items), from `<chat>\n` to the first block
- * ending `\n</chat>`. A `<chat>` pasted elsewhere is never considered.
+ * (after Responses developer/system items and OMP's optional date/cwd control),
+ * from `<chat>\n` to the first block ending `\n</chat>`. Arbitrary leading text
+ * or a `<chat>` pasted elsewhere is never considered.
  */
 function leadingView(messages: unknown[], textType: string, kind: OptChatCacheKind): LeadingView | undefined {
 	let index = 0;
@@ -98,10 +101,16 @@ function leadingView(messages: unknown[], textType: string, kind: OptChatCacheKi
 	const texts: string[] = [];
 	const ends: number[] = [];
 	let length = 0;
-	for (const block of entry.content) {
+	let blockOffset = 0;
+	for (let blockIndex = 0; blockIndex < entry.content.length; blockIndex++) {
+		const block = entry.content[blockIndex];
 		if (!object(block) || block.type !== textType || typeof block.text !== "string") return;
 		for (const field in block) {
 			if (!Object.hasOwn(VIEW_BLOCK_FIELDS, field)) return;
+		}
+		if (kind === "chat" && blockIndex === 0 && HOST_REMINDER.test(block.text)) {
+			blockOffset = 1;
+			continue;
 		}
 		if (texts.length === 0 && !block.text.startsWith("<chat>\n")) return;
 		texts.push(block.text);
@@ -113,7 +122,7 @@ function leadingView(messages: unknown[], textType: string, kind: OptChatCacheKi
 		const cuts = viewCuts(view);
 		const marks: number[] = [];
 		for (let i = 0; i < ends.length; i++) {
-			if (cuts.includes(ends[i]!)) marks.push(i);
+			if (cuts.includes(ends[i]!)) marks.push(i + blockOffset);
 		}
 		return { index, marks };
 	}

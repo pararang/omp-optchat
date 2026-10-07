@@ -698,6 +698,30 @@ describe("provider gates", () => {
 // ---- view admission ----------------------------------------------------------
 
 describe("view admission", () => {
+  test.each(ADAPTERS)("$name retains memory cache metadata after the host's date/cwd reminder", (adapter) => {
+    const input = adapter.payload();
+    const content = list(at(input, adapter.list, 0, "content"));
+    const reminder = {
+      type: adapter.textType,
+      text: "<system-reminder>\nToday: 2026-10-07; current working directory: '/tmp/work'. Do not repeat this information in your reply.\n</system-reminder>",
+    };
+    content.unshift(reminder);
+    const result = apply(input, adapter.model());
+    expect(at(result, adapter.list, 0, "content", 0)).toBe(reminder);
+    if (adapter.name === "Codex Responses") {
+      expect(result.reasoning).toEqual({ effort: "high", summary: "auto", context: "all_turns" });
+      expect(result.input).toBe(input.input);
+    } else {
+      const key = adapter.list === "messages" ? "cache_control" : "prompt_cache_breakpoint";
+      const end = adapter.list === "messages" ? "$.messages.2.content.0" : "$.input.3.content.0";
+      expect(markersAt(result, key)).toEqual(expectedMarkers(
+        adapter.list === "messages" ? FIVE_MINUTES : EXPLICIT,
+        `$.${adapter.list}.0.content.1`, `$.${adapter.list}.0.content.2`, `$.${adapter.list}.0.content.3`, end,
+      ));
+      expect(blockTexts(at(result, adapter.list, 0, "content"))).toEqual(blockTexts(content));
+    }
+  });
+
   test.each(ADAPTERS)("$name rejects unlabeled and CRLF chat views by reference", (adapter) => {
     expectChanged(adapter.payload(labeledView(110)), adapter.model());
     expectPassthrough(adapter.payload(unlabeledView(110)), adapter.model());

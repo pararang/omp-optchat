@@ -279,6 +279,30 @@ describe("Store real-filesystem persistence", () => {
     });
   });
 
+  test.skipIf(process.platform !== "darwin")("torn-line recovery refuses a replaced file without modifying either inode", async () => {
+    await withFixture(async (fixture) => {
+      const original = `${JSON.stringify(message(0))}\n{"incomplete":`;
+      const path = await seed(fixture.directory, "main", "2026-01-01.jsonl", [], original);
+      const moved = join(fixture.root, "validated-original");
+      let replaced = false;
+      await expect(fixture.open(() => {
+        if (replaced) return;
+        replaced = true;
+        fs.renameSync(path, moved);
+        fs.writeFileSync(path, "replacement must stay untouched", { mode: 0o600 });
+      })).rejects.toThrow();
+      expect(replaced).toBe(true);
+      expect(await readFile(path, "utf8")).toBe("replacement must stay untouched");
+      expect(await readFile(moved, "utf8")).toBe(original);
+      await rm(path);
+      await rename(moved, path);
+      const recovered = await fixture.open();
+      expect(recovered.messages).toEqual([message(0)]);
+      expect(await readFile(path, "utf8")).toBe(`${original}\n`);
+      expect(recovered.append("user", "after safe recovery").i).toBe(1);
+    });
+  });
+
   test("replay syncs every admitted file before open returns and rejects recovery when that sync fails", async () => {
     await withFixture(async (fixture) => {
       // Complete, newline-terminated records a killed writer never fsynced look
@@ -288,11 +312,12 @@ describe("Store real-filesystem persistence", () => {
         await seed(fixture.directory, "main", "2026-01-02.jsonl", [message(1)]),
         await seed(fixture.directory, "tree", "2026-01-02.jsonl", [node(0, 0)]),
       ];
-      const targets = await Promise.all(files.map((path) => realpath(path)));
+      const inodeKey = ({ dev, ino }: fs.BigIntStats) => `${dev}:${ino}`;
+      const targets = (await Promise.all(files.map((path) => stat(path, { bigint: true })))).map(inodeKey);
       const fsync = fs.fsyncSync;
       const synced: string[] = [];
       const spy = spyOn(fs, "fsyncSync").mockImplementation((fd: number) => {
-        synced.push(fs.readlinkSync(`/proc/self/fd/${fd}`));
+        synced.push(inodeKey(fs.fstatSync(fd, { bigint: true })));
         fsync(fd);
       });
       try {
@@ -300,7 +325,7 @@ describe("Store real-filesystem persistence", () => {
         expect(targets.filter((target) => !synced.includes(target))).toEqual([]);
         await store.close();
         spy.mockImplementation((fd: number) => {
-          if (fs.readlinkSync(`/proc/self/fd/${fd}`) === targets[1]) {
+          if (inodeKey(fs.fstatSync(fd, { bigint: true })) === targets[1]) {
             throw Object.assign(new Error("injected replay fsync failure"), { code: "EIO" });
           }
           fsync(fd);
@@ -719,6 +744,52 @@ describe("Store privacy and lifecycle", () => {
 });
 
 describe("Store process-lifetime lock", () => {
+  test("a renamed root and its symlink alias retain the cross-process lease while a replacement root is independent", async () => {
+    await withFixture(async (fixture) => {
+      const holder = fixture.spawn(`
+        const store = await Store.open(directory);
+        store.append("user", "renamed owner");
+        console.log("ready");
+        // A real interval only holds this native-lock process alive; the parent awaits readiness and death, not time.
+        setInterval(() => {}, 60_000);
+      `);
+      await waitForReady(holder);
+      const moved = join(fixture.root, "moved");
+      const alias = join(fixture.root, "alias");
+      await rename(fixture.directory, moved);
+      await symlink(moved, alias);
+      for (const target of [moved, alias]) {
+        const contender = fixture.spawn(`
+          let store;
+          try { store = await Store.open(directory); }
+          catch { console.log("rejected"); process.exit(0); }
+          await store.close();
+          console.error("competing writer unexpectedly acquired renamed root");
+          process.exit(1);
+        `, target);
+        expect(await processResult(contender)).toEqual({ code: 0, stdout: "rejected\n", stderr: "" });
+      }
+      const replacement = fixture.spawn(`
+        const store = await Store.open(directory);
+        store.append("user", "replacement owner");
+        await store.close();
+        console.log("independent");
+      `);
+      expect(await processResult(replacement)).toEqual({ code: 0, stdout: "independent\n", stderr: "" });
+      expect(holder.exitCode).toBeNull();
+      holder.kill("SIGKILL");
+      await withDeadline(holder.exited, "renamed holder exit");
+
+      const recovered = await fixture.open(undefined, alias);
+      expect(recovered.messages.map((record) => record.text)).toEqual(["renamed owner"]);
+      expect(recovered.append("talk", "recovered renamed root").i).toBe(1);
+      expect((await fixture.open()).messages.map((record) => record.text)).toEqual(["replacement owner"]);
+      await recovered.close();
+      expect((await fixture.open(undefined, moved)).messages.map((record) => record.text))
+        .toEqual(["renamed owner", "recovered renamed root"]);
+    });
+  }, 20_000);
+
   test("a real competing process rejects while the holder lives; SIGKILL releases ownership immediately", async () => {
     await withFixture(async (fixture) => {
       const holder = fixture.spawn(`
