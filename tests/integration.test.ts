@@ -93,6 +93,8 @@ const CASE_TITLES = {
   "fake-steering-batch": "a steering-only context batch leaves the open turn alone",
   "fake-late-agent-end": "a late agent_end cannot close an unrelated open turn",
   "fake-continuation": "willContinue retains the view and a terminal agent_end refreshes it",
+  "fake-idle-turn-recovery": "an idle prompt replaces a stale turn even when its terminal notification was missed",
+  "fake-active-context-refusal": "a missing turn marker still refuses active requests without dropping or logging their messages",
   "fake-think-exclusion": "private think calls and results never enter durable memory while talk does",
   "fake-settle-bounds": "settleTimeoutMs rejects zero, NaN and the host deadline but accepts 29999",
   "cap-text": "capText keeps head and tail within the cap without splitting surrogate pairs",
@@ -1761,6 +1763,7 @@ async function disabledFlag(ctx: CaseContext): Promise<Evidence> {
 type FakeHostMessage = OmpSdk.ContextEvent["messages"][number];
 type FakeHostEvent =
   | { type: "session_start" | "session_shutdown" }
+  | { type: "input"; text: string; source: "interactive" | "rpc" | "extension" }
   | { type: "context"; messages: FakeHostMessage[] }
   | { type: "message_end"; message: FakeHostMessage }
   | { type: "agent_end"; messages: FakeHostMessage[]; willContinue: boolean };
@@ -1770,13 +1773,14 @@ interface FakeHost {
   ctx: CaseContext;
   fire(event: FakeHostEvent): Promise<unknown[]>;
   context(messages: FakeHostMessage[]): Promise<WireObject | undefined>;
+  setIdle(idle: boolean): void;
   timestamp(): number;
   user(text: string): Extract<FakeHostMessage, { role: "user" }>;
   assistant(content: AssistantMessage["content"]): AssistantMessage;
 }
 
 /** Only the adapter's touched APIs: no SDK session, registry, auth or provider transport. */
-async function withFakeHost(ctx: CaseContext, run: (host: FakeHost) => Promise<Evidence>): Promise<Evidence> {
+async function withFakeHost(ctx: CaseContext, run: (host: FakeHost) => Promise<Evidence>, expectedRefusals = 0): Promise<Evidence> {
   const memory = await mkdtemp(join(tmpdir(), "optchat-fake-"));
   const fakeCase = { ...ctx, memory };
   const flags: Record<string, string | boolean> = { ...defaultFlags(memory), "optchat-model": "fake/fake" };
@@ -1784,6 +1788,7 @@ async function withFakeHost(ctx: CaseContext, run: (host: FakeHost) => Promise<E
   const registeredTools: Array<{ name: string }> = [];
   const notices: Notice[] = [];
   let abortCalls = 0;
+  let idle = false;
   let lastTimestamp = Date.now();
   const timestamp = (): number => (lastTimestamp = Math.max(Date.now(), lastTimestamp + 1));
   const model = {
@@ -1814,7 +1819,7 @@ async function withFakeHost(ctx: CaseContext, run: (host: FakeHost) => Promise<E
   } as unknown as ExtensionAPI;
   const fakeCtx = {
     getSystemPrompt: () => [ctx.lib.optchat.SYSTEM_BLOCK],
-    isIdle: () => false,
+    isIdle: () => idle,
     abort: () => { abortCalls++; },
     ui: { notify: (message: string, type?: string) => { notices.push({ message, type, at: Date.now() }); } },
     models: { resolve: () => model },
@@ -1835,6 +1840,7 @@ async function withFakeHost(ctx: CaseContext, run: (host: FakeHost) => Promise<E
       ctx: fakeCase,
       fire,
       timestamp,
+      setIdle: (value) => { idle = value; },
       context: async (messages) => {
         const results = await fire({ type: "context", messages });
         assert.equal(results.length, 1, "one OptChat context result");
@@ -1851,8 +1857,10 @@ async function withFakeHost(ctx: CaseContext, run: (host: FakeHost) => Promise<E
         stopReason: "stop", timestamp: timestamp(),
       }),
     });
-    assert.equal(abortCalls, 0, "no fake-host request was refused");
-    assert.deepEqual(notices.filter((notice) => notice.type !== "info"), [], "no startup, logging or compressor failures");
+    assert.equal(abortCalls, expectedRefusals, "only the expected fake-host requests were refused");
+    const errors = notices.filter((notice) => notice.type !== "info");
+    assert.equal(errors.length, expectedRefusals, "only expected refusals emitted errors");
+    assert(errors.every((notice) => notice.type === "error"), "no startup, logging or compressor warnings");
     return { ...evidence, registeredTools: registeredTools.map((tool) => tool.name) };
   } finally {
     try {
@@ -1863,6 +1871,63 @@ async function withFakeHost(ctx: CaseContext, run: (host: FakeHost) => Promise<E
   }
 }
 
+async function fakeIdleTurnRecovery(ctx: CaseContext): Promise<Evidence> {
+  return withFakeHost(ctx, async (host) => {
+    const user = host.user("U1");
+    const opened = await host.context([user]);
+    assert(opened, "the first request opens a turn");
+    const talk = host.assistant([{ type: "text", text: "T1" }]);
+    await host.fire({ type: "message_end", message: talk });
+    // The stale terminal event cannot close U1; the real terminal notice never arrives.
+    const late = host.assistant([{ type: "text", text: "OLD" }]);
+    await host.fire({ type: "agent_end", messages: [late], willContinue: false });
+    const nextUser = host.user("U2");
+    host.setIdle(true);
+    await host.fire({ type: "input", text: "U2", source: "interactive" });
+    host.setIdle(false);
+    const next = await host.context([talk, nextUser]);
+    assert(next, "the idle prompt recovers even though U1 is absent from host history");
+    assert.deepEqual(wireMessages(next).slice(1), [nextUser], "the new prompt is preserved verbatim");
+    const nextView = soleView(next, "idle recovery");
+    assert(nextView.includes("0+1|user: U1\n"), "the previous prompt survives in memory");
+    assert(nextView.includes("1+1|talk: T1\n"), "the completed reply survives in memory");
+    assert(!nextView.includes("U2"), "the new prompt is logged after its snapshot");
+    const nextTalk = host.assistant([{ type: "text", text: "T2" }]);
+    await host.fire({ type: "message_end", message: nextTalk });
+    // Missing terminal notification with the old marker still present must also refresh.
+    const thirdUser = host.user("U3");
+    host.setIdle(true);
+    await host.fire({ type: "input", text: "U3", source: "rpc" });
+    host.setIdle(false);
+    const third = await host.context([talk, nextUser, nextTalk, thirdUser]);
+    assert(third, "another idle prompt opens a fresh turn");
+    assert.deepEqual(wireMessages(third).slice(1), [thirdUser], "completed turns are not resent raw");
+    const thirdView = soleView(third, "idle recovery with retained marker");
+    assert(thirdView.includes("2+1|user: U2\n") && thirdView.includes("3+1|talk: T2\n"), "the view advances despite the retained old marker");
+    assert(!thirdView.includes("U3"), "the third prompt remains outside memory");
+    const rows = pairs(await durableRows(host.ctx, 5, "recovered prompts durable"));
+    assert.deepEqual(rows, [["user", "U1"], ["talk", "T1"], ["user", "U2"], ["talk", "T2"], ["user", "U3"]], "recovery neither loses nor duplicates messages");
+    return { rows, nextView, thirdView };
+  });
+}
+
+async function fakeActiveContextRefusal(ctx: CaseContext): Promise<Evidence> {
+  return withFakeHost(ctx, async (host) => {
+    const user = host.user("U1");
+    const opened = await host.context([user]);
+    assert(opened, "the first request opens a turn");
+    const talk = host.assistant([{ type: "text", text: "T1" }]);
+    await host.fire({ type: "message_end", message: talk });
+    const queued = host.user("QUEUED");
+    await host.fire({ type: "input", text: "QUEUED", source: "interactive" });
+    assert.deepEqual(await host.context([talk, queued]), { messages: [] }, "an active request missing U1 sends nothing");
+    assert.deepEqual(pairs(mainRows(host.ctx.memory)), [["user", "U1"], ["talk", "T1"]], "refusal does not log a new prompt or replace the snapshot");
+    const continued = await host.context([user, talk, queued]);
+    assert.deepEqual(continued, { messages: [wireMessages(opened)[0]!, user, talk, queued] }, "restoring the marker preserves the original view and every raw active message");
+    return { refusedRequests: 1, viewUnchanged: true };
+  }, 1);
+}
+
 async function fakeSteeringBatch(ctx: CaseContext): Promise<Evidence> {
   return withFakeHost(ctx, async (host) => {
     const user = host.user("U1");
@@ -1871,10 +1936,14 @@ async function fakeSteeringBatch(ctx: CaseContext): Promise<Evidence> {
       { role: "user", content: [{ type: "text", text: "<chat>\n</chat>" }], timestamp: user.timestamp },
       user,
     ] }, "the first request contains exactly a view and U1");
+    const talk = host.assistant([{ type: "text", text: "T1" }]);
+    await host.fire({ type: "message_end", message: talk });
+    await host.fire({ type: "input", text: "S1", source: "interactive" });
     const steering = { ...host.user("S1"), steering: true };
     assert.equal(await host.context([steering]), undefined, "a steering-only batch lacking U1 stays untouched");
-    const rows = await durableRows(host.ctx, 1, "fake steering initial user durable");
-    assert.deepEqual(pairs(rows), [["user", "U1"]], "context conversion alone does not log the steering batch");
+    assert.deepEqual(await host.context([user, talk, steering]), { messages: [wireMessages(opened)[0]!, user, talk, steering] }, "busy input and steering preserve the view and full raw loop");
+    const rows = await durableRows(host.ctx, 2, "fake steering initial turn durable");
+    assert.deepEqual(pairs(rows), [["user", "U1"], ["talk", "T1"]], "context conversion alone does not log the steering batch");
     return { rows: pairs(rows), steeringResult: "undefined" };
   });
 }
@@ -2120,6 +2189,8 @@ const CASES: Record<CaseName, (ctx: CaseContext) => Promise<Evidence>> = {
   "fake-steering-batch": fakeSteeringBatch,
   "fake-late-agent-end": fakeLateAgentEnd,
   "fake-continuation": fakeContinuation,
+  "fake-idle-turn-recovery": fakeIdleTurnRecovery,
+  "fake-active-context-refusal": fakeActiveContextRefusal,
   "fake-think-exclusion": fakeThinkExclusion,
   "fake-settle-bounds": fakeSettleBounds,
   "cap-text": capTextUnit,

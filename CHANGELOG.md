@@ -7,6 +7,7 @@
 - Keep provider cache markers and Codex reasoning retention active when OMP 18.8 prepends its date/cwd reminder.
 - Run CI on Linux and macOS, with portable replay-fsync observation and cross-process renamed-root lock coverage.
 - Document macOS build prerequisites and the Bun 1.4+ requirement for installing the checked-in lockfile.
+- Recover stale OptChat turns at idle input boundaries without weakening active-context refusals. See [safe context recovery](CONTEXT_RECOVERY.md).
 
 ## 0.1.0 — 2026-10-05
 

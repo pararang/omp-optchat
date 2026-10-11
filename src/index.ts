@@ -405,6 +405,14 @@ class OptChat {
 
 	// --- host events -----------------------------------------------------------------
 
+	input(ctx: ExtensionContext): void {
+		if (!ctx.isIdle()) return;
+		// Input arrives before prompt setup marks the host busy. Its idle state proves
+		// the prior loop is over, even if its terminal notification was missed.
+		this.saveUnanswered();
+		this.turn = undefined;
+	}
+
 	beforeAgentStart(systemPrompt: string[]): { systemPrompt: string[] } {
 		return { systemPrompt: systemPrompt.includes(SYSTEM_BLOCK) ? systemPrompt : [...systemPrompt, SYSTEM_BLOCK] };
 	}
@@ -751,6 +759,7 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 			const active = new OptChat(pi, settleTimeoutMs);
 			chat = active;
 			// Registered only for an activated session: these hooks change host behavior even as no-ops.
+			pi.on("input", (_event, handlerCtx) => active.input(handlerCtx));
 			pi.on("before_agent_start", (event) => active.beforeAgentStart(event.systemPrompt));
 			pi.on("context", (event, handlerCtx) => active.context(event.messages, handlerCtx));
 			pi.on("before_provider_request", (event, handlerCtx) =>
