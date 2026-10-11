@@ -3,6 +3,8 @@ import { createRequire } from "node:module";
 interface DarwinStorage {
   openAt(directoryFd: number, name: string, flags: number, mode: number): number;
   mkdirAt(directoryFd: number, name: string): void;
+  renameAt(oldDirectoryFd: number, oldName: string, newDirectoryFd: number, newName: string): void;
+  unlinkAt(directoryFd: number, name: string): void;
   readDirectory(directoryFd: number): string[];
   /** Diagnostics only; filesystem I/O never goes through the returned path. */
   descriptorPath(fd: number): string;

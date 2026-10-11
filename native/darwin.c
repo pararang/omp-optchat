@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdio.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -109,6 +110,30 @@ static napi_value mkdir_at(napi_env env, napi_callback_info info) {
   return result;
 }
 
+static napi_value rename_at(napi_env env, napi_callback_info info) {
+  napi_value values[4], result;
+  int old_directory, new_directory;
+  char old_name[PATH_MAX], new_name[PATH_MAX];
+  if (!arguments(env, info, 4, values) || !integer(env, values[0], &old_directory) ||
+      !filename(env, values[1], old_name) || !integer(env, values[2], &new_directory) ||
+      !filename(env, values[3], new_name)) return NULL;
+  if (renameat(old_directory, old_name, new_directory, new_name) == -1)
+    return system_error(env, errno, "renameat");
+  napi_get_undefined(env, &result);
+  return result;
+}
+
+static napi_value unlink_at(napi_env env, napi_callback_info info) {
+  napi_value values[2], result;
+  int directory;
+  char name[PATH_MAX];
+  if (!arguments(env, info, 2, values) || !integer(env, values[0], &directory) ||
+      !filename(env, values[1], name)) return NULL;
+  if (unlinkat(directory, name, 0) == -1) return system_error(env, errno, "unlinkat");
+  napi_get_undefined(env, &result);
+  return result;
+}
+
 static napi_value read_directory(napi_env env, napi_callback_info info) {
   napi_value value, result;
   int directory;
@@ -173,6 +198,8 @@ static napi_value initialize(napi_env env, napi_value exports) {
   const napi_property_descriptor properties[] = {
     {"openAt", NULL, open_at, NULL, NULL, NULL, napi_default, NULL},
     {"mkdirAt", NULL, mkdir_at, NULL, NULL, NULL, napi_default, NULL},
+    {"renameAt", NULL, rename_at, NULL, NULL, NULL, napi_default, NULL},
+    {"unlinkAt", NULL, unlink_at, NULL, NULL, NULL, napi_default, NULL},
     {"readDirectory", NULL, read_directory, NULL, NULL, NULL, napi_default, NULL},
     {"descriptorPath", NULL, descriptor_path, NULL, NULL, NULL, napi_default, NULL},
     {"lockDirectory", NULL, lock_directory, NULL, NULL, NULL, napi_default, NULL},
